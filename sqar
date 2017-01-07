@@ -1,0 +1,1514 @@
+#!/usr/bin/perl -w
+# qar client/server tool -- Chris Houser, Aron Griffis, April 2001
+# $Id: sqar,v 1.23 2002/01/15 23:06:22 chouser Exp $
+
+# TODO:
+# add "set screen" to editor statemachine
+# handle --batchcmd options on command-line
+# check last for linefeed, add one only if needed
+# add options to choose server and database
+# pool of servers
+# test effect of keystrokes during local edit (send and recv)
+# vim syntax file
+# smarter caching
+#    invalidate a qar after it has been answered
+#    link commands "read 1234" and "1234"
+#    ...etc...
+# add "any" option to --serveraddr
+# column management?
+# hack in use of oldqar?
+
+use strict;
+
+package StreamBuf;
+use FileHandle;
+
+sub READ_OK()      {0}
+sub READ_EOF()     {1}
+sub READ_BLOCKED() {2}
+
+sub new {
+    my ($class, $name, $instream, $outstream) = @_;
+
+    # init
+    my $self = {
+        name      => $name,
+        instream  => $instream,
+        outstream => $outstream || $instream,
+        buf       => '',
+        lastread  => READ_OK,
+        eol       => "\n",
+    };
+    bless $self, $class;
+
+    # make sure this stream doesn't block the whole server
+    fcntl($self->{instream}, F_SETFL, O_NONBLOCK) or die;
+
+    # return me
+    return $self;
+}
+
+sub seteol {
+    my ($self, $eol) = @_;
+    $self->{eol} = $eol;
+}
+
+sub fileno {
+    my ($self, $out) = @_;
+    return CORE::fileno($self->{outstream}) if $out;
+    return CORE::fileno($self->{instream});
+}
+
+sub readbuf {
+    my ($self) = @_;
+
+    # read a buffer
+    my $buf;
+    my $len = sysread $self->{instream}, $buf, 1024;
+
+    # update state
+    if (defined $len) {
+        if ($len < 1) {
+            $self->{lastread} = READ_EOF;
+        }
+        else {
+            $self->{lastread} = READ_OK;
+            $self->{buf} .= $buf;
+        }
+    }
+    elsif ($! == 35) {
+        $self->{lastread} = READ_BLOCKED;
+    }
+    else {
+        die "Error reading from stream $self->{name}: $!\n";
+    }
+}
+
+sub dataready {
+    my ($self) = @_;
+    return $self->{lastread} != READ_BLOCKED;
+}
+
+sub lineready {
+    my ($self) = @_;
+    return 1 if $self->{buf} =~ /\n/;                          # whole line
+    return 1 if $self->{lastread} != READ_OK && $self->{buf};  # partial line
+    return 1 if $self->{lastread} == READ_EOF;                 # eof
+    return 0;
+}
+
+sub getline {
+    my ($self) = @_;
+
+    my $rtn;
+    if ($self->{buf} =~ s/^.*\n//) {
+        # return a whole line
+        $rtn = $&;
+    }
+    elsif ($self->{lastread} != READ_OK && $self->{buf}) {
+        # return a partial line
+        $rtn = $self->{buf};
+        $self->{buf} = '';
+    }
+    elsif ($self->{lastread} == READ_EOF) {
+        # return EOF
+        undef $rtn;
+    }
+    else {
+        warn "\nError -- getline should not have been called ($self->{name})\n";
+        undef $rtn;
+    }
+
+    return $rtn;
+}
+
+sub write {
+    my ($self, $text) = @_;
+    syswrite $self->{outstream}, $text;
+}
+
+sub writeln {
+    my ($self, $line) = @_;
+    $self->write("$line" . $self->{eol});
+}
+
+
+package StreamPlex;
+
+sub new {
+    my ($class, @streams) = @_;
+
+    # bless me, I'm a hash
+    my $self = {};
+    bless $self, $class;
+
+    # init
+    $self->{streams} = [];
+    $self->{selectmask} = '';
+
+    # add any streams given
+    for my $stream (@streams) {
+        $self->addstream($stream);
+    }
+
+    # return me
+    return $self;
+}
+
+sub addstream {
+    my ($self, $newstream) = @_;
+
+    # add new stream to list
+    push @{$self->{streams}}, $newstream;
+
+    # add new stream to selectmask
+    vec($self->{selectmask}, $newstream->fileno, 1) = 1;
+}
+
+sub delstream {
+    my ($self, $oldstream) = @_;
+    
+    # remove old stream from selectmask
+    vec($self->{selectmask}, $oldstream->fileno, 1) = 0;
+
+    # find the old stream in my stream list
+    my @streams;
+    foreach my $stream (@{$self->{streams}}) {
+        push @streams, $stream unless $stream == $oldstream;
+    }
+
+    @streams == @{$self->{streams}} && warn "Asked to delete unknown stream\n";
+    $self->{streams} = \@streams;
+}
+
+sub readln {
+    my ($self) = @_;
+    die "no streams!\n" unless @{$self->{streams}};
+
+    my @dataready = ();
+    my @lineready = ();
+    POLLSTREAMS: {
+        # poll all streams
+        foreach my $stream (@{$self->{streams}}) {
+            $stream->readbuf;
+            push @dataready, $stream if $stream->dataready;
+            push @lineready, $stream if $stream->lineready;
+        }
+
+        # if all streams are blocking and cacheless, wait for one to be ready
+        if (! @dataready && ! @lineready) {
+            my $outbits = $self->{selectmask};
+            select($outbits, undef, undef, 10);
+            redo POLLSTREAMS;
+        }
+
+        # we also need to go around again if no lines are ready
+        redo unless @lineready;
+    }
+
+    # return first cached line from first willing stream
+    foreach my $stream (@lineready) {
+        my $line = $stream->getline;
+        defined $line or $self->delstream($stream);  # EOF
+        return ($stream, $line);
+    }
+
+    # no streams ready?  maybe they're all closed
+    return (undef, undef);
+}
+
+package QARSession;
+use IPC::Open2;
+use FileHandle;
+
+sub new {
+    my ($class, $debug) = @_;
+
+    # bless me, I'm a hash
+    my $self = {'debug' => $debug};
+    bless $self, $class;
+
+    # default host
+    $self->{hostname} = "gorge";
+
+    # fork off a telnet process
+    $self->{to}   = new FileHandle;
+    $self->{from} = new FileHandle;
+    $self->{pid}  = open2($self->{from}, $self->{to}, "telnet $self->{hostname}");
+
+    # set up streams
+    $self->{host} = new StreamBuf ('host', $self->{from}, $self->{to});
+    $self->{plex} = new StreamPlex($self->{host});
+    $self->{host}->seteol("\r");
+
+    # return me
+    return $self;
+}
+
+sub login {
+    my ($self) = @_;
+
+    # get configuration
+    my $username = $main::config->get('username');
+    my $password = $main::config->get('password');
+    my $termtype = $main::config->get('termtype');
+
+    defined $username && defined $password
+        or die "Username and Password are required\n";
+    my $page = 1; 
+    $self->{state} = 1;
+    $|=1;
+
+    # remap termtype from name to escape sequence
+    {
+        $termtype =~ /^LA100$/i and $termtype = "\e[?10;2c" and next;
+        $termtype =~ /^VT100$/i and $termtype = "\e[?1;2c"  and next;
+        $termtype = eval qq{"$termtype"};
+    }
+
+    my $which;
+    my $host = $self->{host};
+    while (($which, $_) = $self->{plex}->readln) {
+        if ($self->{debug}) {
+            my $n = $_;
+            $n =~ s/\r/^M/g;
+            $n =~ s/\000/^@/g;
+            print "($n)";
+        }
+        /\rUsername: $/       and $host->writeln($username) and next;
+        /\rPassword: $/       and $host->writeln($password) and next;
+        /\eZ/                 and $host->write($termtype)   and next;
+        /Which QAR database/  and $host->writeln("OSF_QAR") and next;
+        /QAR> $/ &&  $page    and ($page=0, $host->writeln("nopage")) and next;
+        /QAR> $/ && !$page    and last;
+    }
+    $self->{state} = 2;
+}
+
+sub docmd {
+    my ($self, $clientref) = @_;
+    $self->{state} = 3;
+
+    # add client to stream plex
+    my $clientstream = new StreamBuf('client', $clientref->[0]);
+    $self->{plex}->addstream($clientstream);
+
+    my $interact = 0;
+    my $cachetemp = '';
+    my $cachelines = 0;
+    my $cachekey = '';
+    my $writeclient = 1;
+
+    while (my ($which, $line) = $self->{plex}->readln) {
+        my $n;
+        if ($line) {
+            $n = $line;
+            $n =~ s/\r/^M/g;
+            #$n =~ s/\n/^J/g;
+            $n =~ s/\003/^C/g;
+            $n =~ s/\032/^Z/g;
+            $n =~ s/\000/^@/g;
+            $n =~ s/\033/^[/g;
+            $n =~ s/[^]?:.;<>[\w\s^-]/'<'.ord($&).'>'/eg;
+        }
+        if ($which == $self->{host}) {
+            return 0 unless $line;  # server disconnect
+            print "{$n}" if $self->{debug};
+            $line =~ /^QAR> $/ and last;
+
+            # escape tildes
+            $line =~ s/~/~~/g;
+
+            $cachetemp .= $line;
+            $cachelines += 1;
+            $clientstream->write($line) if $writeclient;
+        }
+        else {
+            return 1 unless $line;  # abnormal client disconnect
+            print "<$n>" if $self->{debug};
+            $line =~ s/\n/\r/g;  # a client \n is a gorge \r
+            if ($line eq "reload\r") {
+                main::reload();
+                last;
+            }
+            else {
+                ++$interact;
+                if ($interact == 1) {
+                    $cachekey = $line;
+                    if (main::isbatchcmd($line)
+                            && exists $main::cache{$cachekey}) {
+                        $clientstream->write("~cachehit~");
+                        my $entry = $main::cache{$cachekey};
+                        $clientstream->write("~lines:$entry->{lines}~");
+                        $clientstream->write($entry->{data});
+
+                        # done with client
+                        $writeclient = 0;
+                        $self->{plex}->delstream($clientstream);
+                        undef $clientstream;
+                        undef $clientref->[0];
+                    }
+                }
+                $self->{host}->write($line);
+            }
+        }
+    }
+    $self->{state} = 2;
+
+    # done with client
+    $self->{plex}->delstream($clientstream) if $writeclient;
+
+    # update cache if we can
+    if ($interact == 1 && $cachekey) {
+        $main::cache{$cachekey} = {
+            'data'  => $cachetemp,
+            'lines' => $cachelines,
+        }
+    }
+    return 1;
+}
+
+package LocalTerm;
+use POSIX qw(:termios_h);
+
+sub new {
+    my ($class) = @_;
+
+    # bless me, I'm a hash
+    my $self = {};
+    bless $self, $class;
+
+    # init
+    $self->{needsreset} = 0;
+
+    # get current term state
+    $self->{fd} = fileno(STDIN);
+    $self->{posixterm} = POSIX::Termios->new();
+    $self->{posixterm}->getattr($self->{fd});
+    $self->{origflags} = $self->{posixterm}->getlflag();
+    $self->initsize;
+
+    # return me
+    return $self;
+}
+
+sub get {
+    return $_[0]->{$_[1]};
+}
+
+sub initsize {
+    my ($self) = @_;
+
+    # get current term size
+    my $TIOCGWINSZ;
+    if ((POSIX::uname)[0] eq 'OSF1') {
+        # Tru64
+        $TIOCGWINSZ = 0x40000000 | ((8 & 0x1fff) << 16) | (116 << 8) | 104;
+    } else {
+        # Linux
+        require 'asm/ioctls.ph';
+        $TIOCGWINSZ = &TIOCGWINSZ;
+    }
+
+    my %vals;
+    my $winsize = '';
+    open(TTY, "+</dev/tty") or do{warn "No tty: $!"; return};
+    ioctl(TTY, $TIOCGWINSZ, $winsize) or do{warn "ioctl TIOCGWINSZ: $!";return};
+    @vals{'row', 'col', 'xpixel', 'ypixel'} = unpack('S4', $winsize);
+    %$self = (%$self, %vals);
+}
+
+sub setpassthru {
+    my ($self) = @_;
+    my $posixterm = $self->{posixterm};
+
+    $self->{needsreset} = 1;
+    $posixterm->setlflag($self->{origflags} & ~(ISIG | ECHO | ECHOK | ICANON));
+    $posixterm->setcc(VTIME, 1);
+    $posixterm->setattr($self->{fd}, TCSANOW);
+}
+
+sub reset {
+    my ($self, $always) = @_;
+    if ($self->{needsreset} || $always) {
+        my $posixterm = $self->{posixterm};
+        $posixterm->setlflag($self->{origflags});
+        $posixterm->setcc(VTIME, 0);
+        $posixterm->setattr($self->{fd}, TCSANOW);
+    }
+}
+
+sub DESTROY {
+    my ($self) = @_;
+    $self->reset;
+}
+
+
+package Config;
+use Getopt::Long;
+
+sub new {
+    my ($class) = @_;
+
+    # set default configuration and list of valid config var names
+    my $self = {
+        'allowclear'     => 0,
+        'batchcmd'       => ['^read', '^\d+', '^dir'],   # regexp
+        'clientport'     => undef,
+        'clientaddr'     => 'localhost',
+        'deltemp'        => 1,
+        'help'           => undef,
+        'listen'         => undef,
+        'mkrc'           => undef,
+        'pageheight'     => 'auto',
+        'password'       => undef,
+        'reload'         => undef,
+        'serveraddr'     => 'localhost',
+        'serverport'     => 1357,
+        'servertimeout'  => 60,                          # minutes
+        'termtype'       => 'VT100',
+        'uselocaleditor' => 1,
+        'userescape'     => '~',
+        'username'       => undef,
+    };
+    $self->{'clientport'} = $self->{'serverport'};
+
+    # bless me, I'm a hash
+    bless $self, $class;
+
+    # return me
+    return $self;
+}
+
+sub loadfile {
+    my ($self, $rcfile) = @_;
+
+    $rcfile ||= "$ENV{HOME}/.sqarrc";
+    return unless -e $rcfile;
+    $self->{'_rcfile'} = $rcfile;
+
+    open F, $rcfile;
+    while(<F>) {
+        # skip comments and blank lines
+        next if /^\s*(#.*)?\s*$/;
+
+        # parse line
+        my ($name, $op, $val) = (/^\s*(\w+)-?(\w*)\s+(.*?)\s*$/);
+        $name or warn "Error parsing $rcfile, line $.\n" and next;
+        $name = lc $name;
+        $op   = lc $op;
+
+        # handle quoted values
+        $val =~ s/^"(.*)"$/$1/;
+
+        # check for valid config variable
+        unless (exists $self->{$name}) {
+            warn "Unknown config option in $rcfile line $.: $_\n";
+            next;
+        }
+
+        ''      eq $op and $self->{$name} = $val;
+        'clear' eq $op and $self->{$name} = [];
+        'add'   eq $op and push @{$self->{$name}}, $val;
+    }
+    close F;
+}
+
+sub loadcommandline {
+    my ($self) = @_;
+    GetOptions ($self, map {"$_:s"} (grep !/^_/, keys %$self));
+}
+
+sub get {
+    return $_[0]->{$_[1]};
+}
+
+sub getrcfile {
+    return $_[0]->{'_rcfile'};
+}
+
+
+package EditIfc;
+use POSIX qw(tmpnam);
+
+sub new {
+    my ($class) = @_;
+
+    # bless me, I'm a hash
+    my $self = {};
+    bless $self, $class;
+
+    # set up state machine order
+    my $editstate = 0;
+    $self->{'estab'} = {
+        SET0       => $editstate++,
+        SET1       => $editstate++,
+        SET2       => $editstate++,
+        SET3       => $editstate++,
+        SET4       => $editstate++,
+        TYPE_WHOLE => $editstate++,
+        LOCAL_EDIT => $editstate++,
+        DELETE     => $editstate++,
+        INSERT     => $editstate++,
+        EXIT       => $editstate++
+    };
+    $self->{'editstate'} = 0;
+
+    # return me
+    return $self;
+}
+
+sub useline {
+    my ($self, $line, $server) = @_;
+    my $echocmd;
+
+    # check for editor prompt
+    my $editstate = $self->{'editstate'};
+    my $editprompt = ($line =~ /^\r\*$/);
+    return unless $editstate || $editprompt;
+
+    # dig into the state machine
+    if ($editstate >= $self->{'estab'}{'SET0'}
+        && $editstate <= $self->{'estab'}{'SET4'}
+        && $editprompt) 
+    {
+        my $echocmd = (
+            $editstate == $self->{'estab'}{'SET0'} && 'set term hcpy' ||
+            $editstate == $self->{'estab'}{'SET1'} && 'set term noeightbit' ||
+            $editstate == $self->{'estab'}{'SET2'} && 'set term noedit' ||
+            $editstate == $self->{'estab'}{'SET3'} && 'set nowrap' ||
+            $editstate == $self->{'estab'}{'SET4'} && 'set notruncate');
+        $server->writeln($echocmd);
+        ++$self->{'editstate'};
+        return $echocmd;
+    }
+
+    if ($editstate == $self->{'estab'}{'TYPE_WHOLE'} && $editprompt) {
+        $self->{'editbuffer'} = '';
+        ++$self->{'editstate'};
+        $echocmd = 'type whole';
+        $server->writeln($echocmd);
+        return $echocmd;
+    }
+
+    if ($editstate == $self->{'estab'}{'LOCAL_EDIT'}){
+        if ($line !~ /\[EOB\]\s*$/) {
+            # Don't trust that the server is getting the
+            # line breaks right.  It doesn't always.
+            # Consider the difference between the two
+            # following examples, both of which are
+            # editing the same text.
+            #
+            # }{  136       3^M
+            # }{  137       4^M
+            # }{  138       5^M}{
+            # }{  139       6^M
+            # }{  140       7^M
+            #
+            # }{  136       3^M
+            # }{  137       4^M
+            # }{  138       5^M
+            # }{  139       6^M
+            # }{  140       7^M
+            #
+            # The old code did
+            #    /^\s*\d+\s{7}(.*?)?$/;
+            #    print TEMP "$1\n";
+            # but now instead we suck the whole thing into
+            # a buffer so it should all be right.
+            $self->{'editbuffer'} .= $line;
+        }
+        else {
+            my $editor = $ENV{'EDITOR'} || 'vi';
+            # clean up the editbuffer
+            $self->{'editbuffer'} =~ s/^\s*\d+\s{7}//mg;
+            $self->{'editbuffer'} =~ s/$//mg;
+            # write twice so we can diff
+            my $editorig = tmpnam() . '.qar.txt';
+            open ORIG, ">$editorig";
+            print ORIG $self->{'editbuffer'};
+            close ORIG;
+            $self->{'edittemp'} = tmpnam() . '.qar.txt';
+            open TEMP, ">$self->{'edittemp'}";
+            print TEMP $self->{'editbuffer'};
+            close TEMP;
+            # local edit
+            system $editor, $self->{'edittemp'};
+            # find where the diffs start
+            open ORIG, $editorig;
+            open TEMP, $self->{'edittemp'};
+            for ($self->{'diffstart'} = 1;
+            # read from both filehandles before
+            # testing so that the logic doesn't
+            # short-circuit the second read
+                ($self->{'origline'} = <ORIG>), 
+                ($self->{'templine'} = <TEMP>),
+                defined $self->{'origline'} && defined $self->{'templine'};
+                ++$self->{'diffstart'}) 
+            {
+                last if $self->{'origline'} ne $self->{'templine'};
+            }
+            # don't need ORIG beyond here, but leave
+            # TEMP open since we'll continue reading
+            # from it below
+            close ORIG;
+            unlink $editorig;
+            ++$self->{'editstate'};
+        }
+        return;
+    }
+
+    if ($editstate == $self->{'estab'}{'DELETE'} && $editprompt) {
+        # only execute the delete command if we didn't
+        # reach the end of ORIG
+        if (defined $self->{'origline'}) {
+            undef $self->{'origline'};
+            $echocmd = "delete $self->{'diffstart'}:end";
+            $server->writeln($echocmd);
+        }
+        # only execute the insert command if we didn't
+        # reach the end of TEMP
+        elsif (defined $self->{'templine'}) {
+            ++$self->{'editstate'};
+            $echocmd = 'insert end';
+            $server->writeln($echocmd);
+        }
+        # otherwise skip over the INSERT state completely
+        else {
+            # advance to EXIT and re-enter the state machine
+            $self->{'editstate'} = $self->{'estab'}{'EXIT'};
+            $echocmd = $self->useline($line, $server);
+        }
+        return $echocmd;
+    }
+
+    if ($editstate == $self->{'estab'}{'INSERT'}) {
+        # TEMP is left open from the LOCAL_EDIT state
+        # above, and the first pertinent line is already
+        # in $templine.  If it's undefined, then we've
+        # already reached EOF
+        if (defined $self->{'templine'}) {
+            chomp $self->{'templine'};
+            $server->writeln($self->{'templine'});
+            # get the next line now so it's available the
+            # next time through the loop
+            $self->{'templine'} = <TEMP>;
+        }
+        else {
+            ++$self->{'editstate'};
+            $server->write("\032");  # Ctrl-Z
+        }
+        return;
+    }
+
+    if ($editstate == $self->{'estab'}{'EXIT'} && $editprompt) {
+        close TEMP;
+        unlink $self->{'edittemp'} if $main::config->get('deltemp');
+        $self->{'editstate'} = 0;
+        $echocmd = 'ex';
+        $server->writeln($echocmd);
+        return $echocmd;
+    }
+}
+
+
+package main;
+use IO::Socket;
+
+sub isbatchcmd {
+    my ($cmd) = @_;
+
+    foreach my $match (@{$main::config->get('batchcmd')}) {
+        return 1 if $cmd =~ /$match/;
+    }
+    return 0;
+}
+
+sub doserver {
+    my ($debug) = @_;
+    my $listen = IO::Socket::INET->new(
+        Listen => 5,
+        LocalAddr => $main::config->get('serveraddr'),
+        LocalPort => $main::config->get('serverport'),
+        Reuse => 1,
+    );
+    $listen or die "server already running";
+
+    my $qs = new QARSession($debug);
+    my $from = $qs->{from};
+
+    $qs->login;
+    while (1) {
+        local $SIG{ALRM} = sub { die "alarm\n" };
+        alarm $main::config->get('servertimeout') * 60;
+        my $clientref = [$listen->accept];
+        alarm 0;
+
+        $clientref->[0] or last;
+        $qs->docmd($clientref) or last;
+    }
+}
+
+sub doclient {
+    my ($sock) = @_;
+    $| = 1;
+
+    # setup communication
+    my $server = new StreamBuf('server', $sock);
+    my $plex   = new StreamPlex($server);
+
+    # pager vars
+    my $pagerbuf = '';
+    my $usepager = -1;
+    my $pagerlines = 0;
+    my $pagerlaunched = 0;
+
+    # user state vars
+    my $userline = '';
+    my $userescape = $main::config->get('userescape');
+    my $editifc = new EditIfc;
+
+    # send command to server
+    my $cmd = $main::config->get('reload') ? 'reload' : join(' ', @ARGV);
+    my $echocmd = $cmd;
+    $server->writeln($cmd) if $cmd;
+
+    # set up terminal
+    my $localterm = new LocalTerm;
+    if (!isbatchcmd($cmd)) {
+        $plex->addstream(new StreamBuf('user', *STDIN));
+        $localterm->setpassthru;
+    }
+
+    # set up pageheight
+    my $pageheight = $main::config->get('pageheight');
+    $pageheight = $localterm->get('row') || 24 if lc $pageheight eq 'auto';
+    $usepager = 0 if $pageheight == 0 || !isbatchcmd($cmd);
+
+    my $which;
+    while (($which, $_) = $plex->readln) {
+        if ($which == $server) {
+            # server
+            $_ ||= '';
+
+            # handle tilde commands from server
+            s{~([^~]*)~}{
+                my ($cmd, $arg) = split /:/, $1;
+                my $rtn = '';
+                {
+                    !defined $cmd || $cmd eq '' and $rtn='~' and last;
+                    'cachehit' eq $cmd and do {
+                        print STDERR "Reading from cache...\n";
+                        last;
+                    };
+                    'lines'    eq $cmd and do {
+                        $usepager = ($arg > $pageheight) if $usepager < 0;
+                        last;
+                    }
+                }
+                $rtn;
+            }ge;
+
+            # skip the echo cmd
+            if ($echocmd && $_ eq "$echocmd\r\n") {
+                $echocmd = '';
+                next;
+            }
+            $echocmd = '';
+
+            # check for editor prompt
+            if ($main::config->get('uselocaleditor')) {
+                $echocmd = $editifc->useline($_, $server) || '';
+            }
+
+            # try to decide if we need a pager
+            $pagerlines += 1;
+            $usepager = 1 if $usepager < 0 && $pagerlines > $pageheight;
+
+            # spawn a pager if we know we need one
+            if ($usepager == 1 && ! $pagerlaunched) {
+                my $pager = $ENV{PAGER} || 'more';
+                open P, "|$pager" or die "Pager ($pager) launch failed: $!\n";
+                select P;
+                $pagerlaunched = 1;
+            }
+
+            # fix control codes
+            unless ($main::config->get('allowclear')) {
+                s/\e[DM78]//g;                  # cursor position
+                s/\e\[[Hf]/\n/g;                # set cursor home
+                s/\e\[\d+;\d+r//g;              # set scroll region
+                s/\e\[\?6[hl]//g;               # turn on/off region
+                s/\e\[\d+;(\d+)[Hf]/\n\e[$1C/g; # set row and col
+                s/\e\[\d+[AB]/\n/g;             # cursor up/down
+                s/\e\[\d?J//g;                  # erase screen
+                #s/\e\[\d?K/\n/g;               # erase line
+                #s/\e\[.m//g;                   # reverse video mode
+            }
+
+            # print a line if we've decided about needing a pager
+            if ($usepager > -1 || !$_) {
+                # print any buffered lines
+                if ($pagerbuf) {
+                    print $pagerbuf;
+                    $pagerbuf = '';
+                }
+                print;
+            }
+            else {
+                # we haven't yet decided about the pager, so store this line
+                $pagerbuf .= $_;
+            }
+
+            # quit if server has cut us off
+            last unless $_;
+        }
+        else {
+            my $disconnect = 0;
+            $userline .= $_;
+            $userline =~ s[\Q$userescape\E(.)][
+                my $mark = $1;
+                my $rtn = $&;
+                {
+                    '.'    eq $mark and do { $disconnect = 1; $rtn = ''; last};
+                    "\032" eq $mark and do { kill('STOP', $$); $rtn = ''; last};
+                }
+                $rtn;
+            ]ge;
+            $_ = $userline;
+            $userline = '';
+
+            if (substr($_, -1) eq $userescape) {
+                $userline = $userescape;
+                $_ = substr($_, 0, length($_) - 1);
+            }
+
+            $server->write($_);
+
+            $disconnect and last;
+        }
+    }
+    print "\n";
+
+    # wait for pager to close
+    if ($pagerlaunched) {
+        close P;
+    }
+}
+
+sub reload {
+    my ($client) = @_;
+    print "reloading...";
+    local $^W = 0;
+    do $0;
+    print "   done\n";
+} 
+
+
+### main program ###
+
+if (defined $main::initted) {
+    # executad only on reload
+    $main::config->loadfile;
+}
+else {
+    # init globals
+    $main::initted = 1;
+    %main::cache = ();
+    
+    # read and interpret .sqarrc
+    $main::config = new Config;
+    $main::config->loadfile;
+    $main::config->loadcommandline;  # only on startup (not on reload)
+
+    if (defined $main::config->get('help')) {
+        my $trans = $INC[0] . "/../../../bin/pod2" . $main::config->get('help');
+        if (-e $trans) {
+            system $trans, $0
+        }
+        else {
+            if ($main::config->get('help') !~ /^(usage|)$/i) {
+                print "\nFailed to find pod translator: $trans";
+            }
+            print "\nUsage: $0 [options] [command]
+  --allowclear boolean              allow unfiltered terminal control codes
+  --batchcmd                        define which command require no interaction
+  --clientaddr address              connect to server at this address
+  --clientport port                 connect to server on this port
+  --deltemp boolean                 delete edit session tempfile after use
+  --help [ usage | text | html ]    print this message or reference docs
+  --listen                          start a forground server
+  --mkrc                            generate a sample .sqarrc file
+  --pageheight [ lines | auto ]     max lines before pager is launched
+  --password password               password to use during server logon
+  --reload                          request server to reload .sqarrc
+  --serveraddr address              qar server will listen at this address
+  --serverport port                 qar server will listen on this port
+  --servertimeout minutes           max time between client connections
+  --termtype [ alias | sequence ]   term type to report during server logon
+  --uselocaleditor boolean          use local editor instead of VMS editor
+  --userescape character            user prefix for local commands (~)
+  --username username               username to use during server logon\n\n"
+        }
+    }
+    elsif (defined $main::config->get('mkrc')) {
+        my $rcfile = $main::config->getrcfile;
+        $rcfile .= ".sample" if -e $rcfile;
+        open RCFILE, ">$rcfile" or die "Couldn't write rcfile ($rcfile): $!\n";
+        while (<DATA>) {
+            last if /__END__/;
+            print RCFILE;
+        }
+    }
+    elsif (defined $main::config->get('listen')) {
+        doserver(1);
+    }
+    else {
+        my $serverspawned = 0;
+        CONNECT: {
+            my $sock = eval {
+                # turn off warnings
+                local $^W = 0;
+
+                # try to connect to server
+                IO::Socket::INET->new(
+                    PeerAddr => $main::config->get('clientaddr'),
+                    PeerPort => $main::config->get('clientport'),
+                );
+            };
+
+            if (!$sock) {
+                if ($serverspawned) {
+                    die "Failed to connect local server!\n";
+                }
+                else {
+                    warn "Spawning new server...\n";
+                    $serverspawned = 1;
+                    unless (fork) {
+                        doserver(0);
+                        exit;
+                    }
+                    sleep 1;
+                    redo CONNECT;
+                }
+            }
+
+            doclient($sock);
+        }
+    }
+    exit 0;
+}
+
+=head1 NAME
+
+sqar - client and server for easier access to the VMS QAR database system
+
+=head1 SYNOPSIS
+
+B<sqar> [ I<options> ] [ I<command> ]
+
+=head1 OPTIONS
+
+=over
+
+=item B<--allowclear> I<boolean>
+
+Defaults to 0, which filters out many annoying terminal sequences from the QAR
+VMS system.  Set to 1 to disable terminal sequence filtering.  See also
+B<--termtype>.
+
+=item B<--batchcmd>
+
+mention -add and -clear
+
+=item B<--clientaddr> I<address>
+
+Defaults to localhost, causing the client to try to connect to an sqar server
+running on the local machine.  If no sqar server can be contacted, one will be
+started on the local machine, and the client will then try again to contact the
+server named in the B<--clientaddr> setting.  See also B<--clientport> below,
+    and "Spawning new server" in the L<"DIAGNOSTICS"> section.
+
+=item B<--clientport> I<port>
+
+Specifies the port on which to contact an sqar server.  Defaults to the value
+of B<--serverport> (usually 1357).  See also B<--clientaddr> above.
+
+=item B<--deltemp> I<boolean>
+
+When a local editor is used (see B<--uselocaleditor> below), the user's changes
+are saved to a temporary file before being transmitted to the sqar server.  If
+B<--deltemp> is 1 (the default), this temporary file will be deleted after the
+changes have been sent to the server.  If B<--deltemp> is set to 0, the
+temporary file will not be deleted, which may be useful for debugging.
+
+=item B<--help> [ I<type> ]
+
+By default, display a brief listing of available options.  If a
+I<type> is specified, B<sqar> will try to find a matching B<pod>
+translator to print out this reference documentation in the given
+format.  Settings for I<type> that should work include B<html>,
+B<man>, and B<text>.  See the L<perlpod> man page.
+
+=item B<--listen>
+
+Start a verbose server in the foreground.  Any QAR commands will be ignored.
+This is useful for debugging, but not generally needed because if a client
+command is executed without a server running, a silent background server will
+be launched automatically (see "Spawning new server" in L<"DIAGNOSTICS">
+below).
+
+=item B<--mkrc>
+
+Generate a sample F<.sqarrc>.  The sample file will be placed in the current
+user's home directory.  It will be named F<.sqarrc>, unless F<$HOME/.sqarrc>
+already exists, in which case it will be named F<.sqarrc.sample>.
+
+=item B<--pageheight> [ I<lines> | B<auto> ]
+
+When the number of lines to be printed by an batch command exceeds I<lines>, a
+pager named in the B<PAGER> environment variable will be launched.  If B<PAGER>
+is unset or null, B<more> will be used.  If B<--pageheight> is set to B<auto>,
+the client will try to determine the height of the current terminal or window,
+and use that value as the pageheight.  If B<--pageheight> is set to zero, a
+pager will never be launched.
+
+=item B<--password> I<password>
+
+Set the password to be used when logging into the VMS QAR database system.
+Note that this variable is only used when the server is first launched; in
+order for changes to take effect, the server will have to be restarted (not
+just reloaded).  See also B<--username>.
+
+=item B<--reload>
+
+Request that the server reload its code and the F<.sqarrc> file.  Note that this
+does not cause the server to log into the VMS QAR database system again, so not
+all configuration settings will be honored.  Note that most options are used by
+the client, so changes take effect as soon as a new client command is started,
+and a server B<--reload> is not required.  See individual configuration
+options for details.
+
+=item B<--serveraddr> I<address>
+
+Specifies the address on which the server will listen for client connections.
+This defaults to localhost, which probably means you will only be able to
+contact the server with client running on the same machine.  See also
+B<--serverport>.
+
+=item B<--serverport> I<port>
+
+Specifies the port on which the server will listen for client connections.
+This defaults to 1357.  It must match the B<--clientport> of the client used to
+connect with this server.
+
+=item B<--servertimeout> I<minutes>
+
+Specifies the maximum number of minutes to wait between client connections --
+defaults to 60 (1 hour).  Note this has no effect on how long a client can
+remain connected to the server, such as during a long localedit session.  Also
+note that if this is set high enough, the VMS QAR system may itself timeout
+before the server does; this may cause Bad Things to Happen.
+
+=item B<--termtype> [ I<alias> | I<sequence> ]
+
+During logon, the VMS system asks for a terminal type.  How the server responds
+depends on this setting.  Currently two type aliases are supported.  The
+default is "VT100", which allows the VMS system to send reverse video and other
+terminal sequences.  Unfortunately, it limits the width of the output to 80
+characters.  Another alias value is "LA100", which allows 132 character-wide
+output, but does not handle backspace sequences very well.
+
+Other terminal types may be specified by providing the escape sequence to send
+back to the VMS system.  If you find another setting that is useful, please
+report it to one of the L<"AUTHORS"> later in this document so that it can be
+included as an alias in a later version.
+
+Note that the value of this option only has any effect
+during VMS logon.
+
+=item B<--uselocaleditor> I<boolean>
+
+When set to 1, the default, the client will watch for an editor prompt from the
+server.  When this prompt is seen, the client will retrieve the full text to be
+edited, and launch a local editing session, allowing you to use the local
+editor of your choice instead of the VMS QAR editor.  When the local editor
+exits, your changes will be relayed to server.  The editor to be launched is
+controlled by the B<EDITOR> environment variable.  If B<EDITOR> is unset or
+null, B<vi> is used.
+
+=item B<--userescape> I<character>
+
+Since control characters typed in the client are relayed to the VMS QAR system, a different means of controlling the client is desirable.  The B<--userescape> option specifies a character that the user may type as a prefix to a client command keystroke.  Currently, the only client command keystroke is the period ".", which causes the client to disconnect from the server.  Defaults to tilde "~", so the full disconnect key sequence would be the two characters "~."
+
+=item B<--username> I<username>
+
+Set the username to be used when logging into the VMS QAR database system.
+Note that this variable is only used when the server is first launched; in
+order for changes to take effect, the server will have to be restarted (not
+just reloaded).  See also B<--password>.
+
+=back
+
+=head1 DESCRIPTION
+
+This tool provides a multi-tier approach to accessing the VMS QAR system used
+in software development at Compaq.
+
+First, B<sqar> is run as a server, either using the B<--listen> option, or by
+being automatically launched in the background (see B<Spawning new server...>
+in L<"DIAGNOSTICS"> below).  As soon as the server is started, it connects to
+the VMS QAR database system, and logs in.  At this point, the server is ready
+to service commands sent from the client.
+
+Once the server is running, B<sqar> may be run as a client to send commands to
+it.  VMS QAR commands may be specified on the B<sqar> command-line, after the
+options.  The VMS QAR command, along with any of its own parameters will be
+passed to the server, which will in turn pass them to the VMS QAR server.
+Responses will be passed back up the line the other way.
+
+How B<sqar> acts while processing a command depends largely on whether or not
+the command being processed is defined as batch command (see B<--batchcmd>).
+If it is a batch command, user input will be disabled, and the response from
+the VMS QAR server may be cached and/or paged.
+
+If the command is not a batch command, the client will enter an interactive
+mode similar to B<telnet> or B<rsh>.  This allows the user to control the VMS
+QAR application directly, and allows the client to provide features such as
+local editor sessions.  In interactive mode, the client will pass all
+keystrokes directly to the server, including Ctrl-C, Ctrl-Z, Backspace, etc.
+This provides expected behavior for user familiar with direct telnet VMS QAR
+sessions, but also requires that the user be provided an alternate way to
+control the client itself.  This is done with a user escape sequence (see
+B<--userescape>).
+
+This document primarily addresses use of the B<sqar> client/server tool itself,
+assuming the user has knowledge of how to use the VMS QAR database system.  The
+VMS QAR application has it's own help system which can be accessed via the
+B<sqar> tool simply by running:
+
+    sqar help
+
+=head1 EXAMPLES
+
+To see a list of all QARs currently maintained by (assigned to) you, with no
+pager:
+
+    sqar --pageheight=0 dir maint
+
+To access the VMS QAR application help:
+
+    sqar help
+
+To respond to QAR number 87531, type the following command, and then answer the
+questions as prompted:
+
+    sqar ans 87531
+
+=head1 ENVIRONMENT VARIABLES
+
+=over
+
+=item PAGER
+
+When executing a I<batch command>, if the number of output lines exceeds
+B<pageheight>, the command set in B<PAGER> is launched.  If B<PAGER> is unset
+or null, B<more> is used.  To prevent a pager from ever being launched, set
+B<--pageheight> to 0.
+
+=item EDITOR
+
+When the client sees a QAR editor prompt (a single asterisk at the beginning of
+a line), if B<--uselocaleditor> is set, the command set in B<EDITOR> will be
+launched.  If B<EDITOR> is unset or null, B<vi> is used.
+
+=back
+
+=head1 FILES
+
+=over
+
+=item $HOME/.sqarrc
+
+Configuration settings.  All options available on the command-line may be set
+here, although not all of them make much sense.  Use B<--mkrc> to generate a
+sample F<.sqarrc> file which includes a description and examples of the syntax
+and a list of all relevant options.  Note that this file was named F<.qarrc> in some older versions of B<sqar>.
+
+=back
+
+=head1 DIAGNOSTICS
+
+=over
+
+=item Spawning new server...
+
+Indicates that no server was found.  This is not an error message, but appears
+to let you know that command you are running will take several extra seconds to
+get started.
+
+=item Reading from cache...
+
+This is not an error message; it just indicates the server is using a cached
+response to your command.  If you want an up-to-date version of the response,
+simply run your command again.  To disable server caching completely, see
+B<--batchcmd>.
+
+=item Unknown option: I<name>
+
+Indicates that the named command-line option was not understood; this option
+will be skipped.  See the L<"OPTIONS"> section of this document, or try B<sqar
+--help> for a complete list of valid command-line options.
+
+=item Unknown config option in I<file> B<line> I<line number>
+
+Indicates a configuration option in your rc file was not understood; this
+option will be skipped.  See the L<"OPTIONS"> section of this document, or try
+B<sqar --help> for a complete list of valid F<.sqarrc> configuration options.
+
+=item Error parsing I<file>B<, line> I<line number>
+
+Indicates that a line in your rc file was improperly formatted and could not be
+parsed; this line will be skipped.  See the L<"FILES"> section of this document
+for information on the correct syntax of the F<.sqarrc> file.
+
+=item Failed to connect local server!
+
+Fatal error.  Usually if a server cannot be found at B<--clientaddr> and
+B<--clientport>, a new server is launched (see B<Spawning new server> and
+B<--listen>).  However, if the attempt to launch a new server fails, or if
+there is a mis-match between the client address/port settings and the server
+address/port settings, the client will still not be able to find a server, and
+this fatal error will be reported.  Try leaving all address and port settings unspecified on the command-line and in your F<.sqarrc> file.
+
+=item Error -- getline should not have been called (I<name>B<)>
+
+Internal error -- please report.
+
+=item Asked to delete unknown stream
+
+Internal error -- please report.
+
+=item No tty: I<error message>
+
+Internal error -- please report.
+
+=item ioctl TIOCGWINSZ: I<error message>
+
+Internal error -- please report.
+
+=back
+
+=head1 AUTHORS
+
+    Chris Houser <chouser@zk3.dec.com>
+    Aron Griffis <agriffis@zk3.dec.com>
+
+=head1 HISTORY
+
+The most direct, and presumably the oldest, access to VMS QAR system used in
+software development at Compaq is by telneting a VAX/VMS server such as gorge.
+Although this gives the user an amazing amount of control, it also removes him
+from his normal local operating environment.
+
+In response to this, a web-based interface was developed called WEB/QAR.
+Although WEB/QAR is generally easier to use than telneting directly, it is also
+more restrictive, and still doesn't allow the user to take advantage of his
+normal command-line environment.  Most obviously missing from WEB/QAR is access
+to your favorite text editor; instead you must use your web browsers text edit
+box.
+
+Another major problem with WEB/QAR is that it provides no easy way to read QAR
+text from your shell prompt.  A tool named B<qar> (written by Ric Werme and
+currently living in /contrib/bin) was written to solve this specific problem by
+accessing WEB/QAR and formatting the results to look like the original VMS QAR
+text.  This B<qar> tool works very well.  By using WEB/QAR, it also uses the
+global WEB/QAR cache, and so it is quite fast.  It's output can be redirected
+on the command line, or it will automatically launch a pager.  The only thing
+it's really missing is the ability to file and update QARs.  This fact inspired
+B<sqar>.
+
+B<sqar> tool was started in April 2001, circumventing WEB/QAR in order to give
+the user the most direct and powerful access to the VMS QAR system.  It tries
+to work as a drop-in replacement for the old B<qar> tool, accepting the same
+syntax and generating the same results.  It also tries to act as an enhancement
+to direct telnet access to gorge by allowing the user to access his normal
+command-line history, shell redirection, and even use his favorite editor.
+
+=cut
+
+__END__
+# .sqarrc -- sample sqar client/server configuration, chouser, may 2001
+# 
+# configuration file for the sqar client/server tool
+# blank lines, and those starting with hash (#) are ignored
+# all other lines should contain a name-value configuration pair
+# names are case-insensitive and must not be quoted
+# values may be quoted with double quotes (")
+# there is no need (and no way) to escape chars in values
+# order is important!
+
+# gorge username and password
+username myusername
+password "verysecretpassword"
+
+# address and port on which the server will listen.
+# defaults to localhost and 1357
+serveraddr localhost
+serverport 1357
+
+# number of minutes that the sqar server will wait since the last client
+# connected, before quitting.  Server reload is required for changes to take
+# effect. Defaults to 60 (1 hour)
+servertimeout 60
+
+# address and port to which the client will try to connect
+# defaults to localhost and serverport
+clientaddr localhost
+#clientport 1357
+
+# type of terminal to report when the VMS asks during login
+# this can be either raw or perl-expanded (qq) escape sequences, or one of a
+# couple supported named types (i.e. LA100).  Server restart is required for
+# changes to take effect. Defaults to VT100
+termtype VT100
+
+# allow clearing of screen.  Defaults to 0
+allowclear 0
+
+# keystroke to use to send a command (like "." disconnect) to the client.
+# defaults to ~
+userescape "~"
+
+# set the pageheight to zero to never use a pager
+# defaults to "auto" which uses the current terminal height
+pageheight auto
+
+# set UseLocalEditor to one to launch your local $EDITOR whenever the VMS
+# server launches its own.  Defaults to 1
+uselocaleditor 1
+
+# a temporary file is created before launching your local editor
+# set deltemp to zero to skip deleting this temp file.  Defaults to 1
+deltemp 1
+
+# launching pagers and server caching only happen on 'batch' commands
+# to make a command be treated as a 'batch' command, use the batchcmd-add name
+# the value of a batchcmd-add configuration is a perl regular expression
+# to clear the list of 'batch' commands, use the batchcmd-clear name.
+# server must be reloaded for changes to effect caching.
+# the batch command list defaults to ('^read', '^\d+', '^dir')
+batchcmd-clear
+batchcmd-add   ^read
+batchcmd-add   ^\d+
+batchcmd-add   ^dir
+__END__
+
+$Log: sqar,v $
+Revision 1.23  2002/01/15 23:06:22  chouser
+added type param to --help option for generating docs from sqar pod
+
+Revision 1.22  2002/01/14 20:02:13  chouser
+renamed to 'sqar'
+changed command-line handling
+added tons of pod (documentation)
+
+# Revision 1.21  2001/05/16  19:04:13  chouser
+# added Aron's code to support 'auto' pageheight
+#
+# Revision 1.20  2001/05/16  04:33:38  chouser
+# extracted local editor state machine from doclient in package main
+# now resides in it's own EditIfc class
+# state machine may now call itself, remove one step from some operations
+#
+# Revision 1.19  2001/05/15  22:11:46  chouser
+# revamped configuration system
+# reload of server now properly reloads rcfile including servertimeout
+# added config vars serveraddr, serverport, clientaddr, clientport
+# removed readconfig from main package and put into new Config class
+#
+# Revision 1.18  2001/05/15  18:53:50  chouser
+# fixed "type whole" showing up in empty edit sessions
+# removed server-side echo control
+# added more sophisticated client-side echo control
+# cleaned up terminal set/reset by moving to LocalTerm object
+#
+# Revision 1.17  2001/05/14  18:17:37  chouser
+# silenced server reload
+# relaxed several VAX-matching regexps
+# changed communication from client through to VAX to be instantaneous,
+# instead of line-at-a-time
+# added options 'termtype', 'allowclear', and 'userescape'
+# disallow user interaction on batch commands
+# set up terminal to disable local echoing and to pass ^C, etc, thru to VAX
+# removed !c, !e, !z sequence checking -- now use control-codes directly
+# added support for rlogin-style local escape sequences
+# moved a calls to exit and readconfig for better reload support
+#
+# Revision 1.16  2001/05/09  22:27:47  chouser
+# removed simple line clipping -- it was rather broken
+# also removed (perhaps temporarily) pagewidth option
+# added warning for unknown configuration options
+# added '.qar.txt' to tempfile names to simplify identification
+# changed '-listen' to '--listen'
+# added '--mkrc' to generate a new .qarrc file for the user
+# attached sample rcfile to the source code
+# fixed up change log at end of file to include all old versions
+# removed 'could not connect to server' warning
+#
+# Revision 1.15  2001/05/07  14:22:24  chouser
+# fixed logic for deciding if we need a pager (again)
+#
+# Revision 1.14  2001/05/07  12:59:21  agriffis
+# changed editstate statemachine to use labels instead of constant numbers
+# changed editting to use a primitive diff instead of always relacing whole file
+# made various other updates to editting logic
+#
+# Revision 1.13  2001/05/04  22:01:22  chouser
+# added support for a ~/.qarrc file
+# removed my password from the code
+# changed servertimeout to minutes (from hours)
+# minor fix to paging code
+#
+# Revision 1.12  2001/05/04  20:45:34  chouser
+# added support for automatically launching a pager on long batch commands
+# 
+# Revision 1.11  2001/05/04  20:00:09  chouser
+# restricted cache hits to 'batch' commands
+# 
+# Revision 1.10  2001/05/04  19:33:05  chouser
+# fixed double-return problem
+# 
+# Revision 1.9  2001/05/04  16:53:28  chouser
+# Added local editor spawning
+# 
+# Revision 1.8  2001/04/26  20:58:40  chouser
+# added blind caching, including early disconnect of client
+# 
+# Revision 1.7  2001/04/26  19:16:33  chouser
+# added auto-spawning of server, and server timeout
+# changed protocol to use tildes instead of a dot on each line
+# added simple line clipping to preset width
+# 
+# Revision 1.6  2001/04/26  08:09:59  chouser
+# revised everything but the main loop.
+# now client and server share a lot of code, and both read and write to both
+# ends at the same time. and can listen to multiple read streams at once.
+# 
+# Revision 1.5  2001/04/16  19:46:26  chouser
+# added support for passthru interaction, demonstrated with the HELP cmd
+# created client<->server protocol using leading char of each line
+# 
+# Revision 1.4  2001/04/16  18:55:48  chouser
+# handle end of telnet connection cleanly
+# skip repeat of command at beginning of output
+# 
+# Revision 1.3  2001/04/16  18:32:23  chouser
+# rewrite.
+# now includes a client, and is more OO.
+# 
+# Revision 1.2  2001/04/12  22:00:06  chouser
+# switched to IO::Socket::INET (from straight Socket)
+# 
+# Revision 1.1  2001/04/12  21:57:39  chouser
+# Initial revision

@@ -1,0 +1,11 @@
+__line cache__   __last read__
+Yes  part   No   Ok  Block EOF   
+ x                x               return cached line
+ x                    x           return cached line
+ x                         x      return cached line
+       x          x               line not ready, ready to read
+       x              x           return partial line
+       x                   x      return partial line
+             x    x               line not ready, ready to read
+             x        x           line not ready, might need select
+             x             x      return EOF

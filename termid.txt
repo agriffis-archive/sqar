@@ -1,0 +1,33 @@
+
+The VAX/VMS command $ SET TERMINAL /INQUIRE sends the
+following sequence of commands "Esc Z", "Esc [ c" and "Esc [ 0c"
+to the terminal.  Digital "VT" terminal products respond with
+a Primary Device Attributes (DA1) report of the form:
+(from VT520/VT525 programmers ref)
+
+Esc   [    ?    6   5   ;   Ps1  ;   ... Psn  c
+9/11 5/11 3/15 3/6 3/5 3/11 3/n 3/11 ... 3/n 6/3
+
+Where:
+    65 = Level 5 terminal (VT500 family)
+     1 = 132 columns
+     2 = Printer port
+     6 = Selective erase
+     7 = Soft character set (DRCS)
+     8 = User-defined keys (UDKs)
+     9 = National replacement char sets (NRCS)
+    12 = Serbo-Croatian (SCS)
+    15 = Technical char set
+    18 = Windowing capability
+    19 = Session capability
+    21 = Horizontal scrolling
+    22 = Color
+    23 = Greek
+    24 = Turkish
+    42 = ISO Latin-2
+    44 = PCTerm
+    45 = Soft key mapping
+    46 = ASCII terminal emulation
+
+http://www.cs.utk.edu/~shuford/terminal/terminal_identification_news.txt
+
